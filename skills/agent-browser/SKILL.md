@@ -203,6 +203,18 @@ agent-browser diff url <url1> <url2> --selector "#main"  # Scope to element
 
 Every session automatically starts a WebSocket stream server on an OS-assigned port. Use `agent-browser stream status` to see the bound port and connection state. Use `stream disable` to tear it down, and `stream enable --port <port>` to re-enable on a specific port.
 
+For stream-input capture recording (JSONL), enable recorder mode with environment variables:
+
+```bash
+AGENT_BROWSER_CAPTURE_MODE=on \
+AGENT_BROWSER_CAPTURE_FILE=./capture.jsonl \
+AGENT_BROWSER_CAPTURE_STDOUT=1 \
+AGENT_BROWSER_CAPTURE_CHECKPOINTS=aggressive \
+agent-browser open https://example.com
+```
+
+Recorder output includes session lifecycle events, frame metadata, raw input records, enriched input records with resolved capture targets, checkpoints, typing bursts, and navigation events.
+
 ## Batch Execution
 
 Execute multiple commands in a single invocation by piping a JSON array of string arrays to `batch`. This avoids per-command process startup overhead when running multi-step workflows.

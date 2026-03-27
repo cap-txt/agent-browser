@@ -976,6 +976,26 @@ agent-browser stream disable              # Stop streaming for the session
 
 The WebSocket server streams the browser viewport and accepts input events.
 
+### Capture recorder (JSONL)
+
+You can enable an env-driven capture recorder for streamed human input. This mode records raw input, checkpoints, enriched targets, typing bursts, navigation events, and session lifecycle entries as JSONL.
+
+```bash
+AGENT_BROWSER_STREAM_PORT=9223 \
+AGENT_BROWSER_CAPTURE_MODE=on \
+AGENT_BROWSER_CAPTURE_CHECKPOINTS=aggressive \
+AGENT_BROWSER_CAPTURE_FILE=./capture.jsonl \
+AGENT_BROWSER_CAPTURE_STDOUT=1 \
+agent-browser open https://example.com
+```
+
+Capture environment variables:
+
+- `AGENT_BROWSER_CAPTURE_MODE=on` enables recording.
+- `AGENT_BROWSER_CAPTURE_FILE=<path>` appends JSONL records to a file.
+- `AGENT_BROWSER_CAPTURE_STDOUT=1` mirrors JSONL records to stdout.
+- `AGENT_BROWSER_CAPTURE_CHECKPOINTS=aggressive` forces frequent checkpoint creation (start, navigation, and before key interaction boundaries).
+
 ### WebSocket Protocol
 
 Connect to `ws://localhost:9223` to receive frames and send input:
