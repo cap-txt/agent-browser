@@ -174,7 +174,7 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_EXTENSIONS</code></td><td>Comma-separated browser extension paths. Extensions work in both headed and headless mode.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_HEADED</code></td><td>Show browser window instead of running headless (<code>1</code> to enable).</td><td>(disabled)</td></tr>
     <tr><td><code>AGENT_BROWSER_STREAM_PORT</code></td><td>Override the WebSocket streaming port. By default, an OS-assigned port is used. Set this to bind to a specific port (e.g., <code>9223</code>).</td><td>OS-assigned</td></tr>
-    <tr><td><code>AGENT_BROWSER_CAPTURE_MODE</code></td><td>Enable stream capture recorder mode. Set to <code>on</code> to write structured JSONL capture events.</td><td>(disabled)</td></tr>
+    <tr><td><code>AGENT_BROWSER_CAPTURE_MODE</code></td><td>Enable capture recorder mode for stream input and direct in-browser user actions. Set to <code>on</code> to write structured JSONL capture events.</td><td>(disabled)</td></tr>
     <tr><td><code>AGENT_BROWSER_CAPTURE_FILE</code></td><td>Append capture JSONL events to this file path.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_CAPTURE_STDOUT</code></td><td>Mirror capture JSONL events to stdout when set to <code>1</code>.</td><td>(disabled)</td></tr>
     <tr><td><code>AGENT_BROWSER_CAPTURE_CHECKPOINTS</code></td><td>Checkpoint strategy for capture mode. Use <code>aggressive</code> for frequent event-time ref checkpoints.</td><td>(none)</td></tr>

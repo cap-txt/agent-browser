@@ -21,6 +21,7 @@ use crate::install::get_dashboard_dir;
 
 const CAPTURE_MARKER_ATTR: &str = "data-agent-browser-capture";
 const TYPING_BURST_IDLE_MS: u64 = 400;
+const CAPTURE_BINDING_NAME: &str = "agentBrowserCapture";
 
 /// Frame metadata from CDP Page.screencastFrame events.
 #[derive(Debug, Clone)]
@@ -918,6 +919,10 @@ async fn cdp_event_loop(
                     )
                     .await;
 
+                if capture.recorder.is_some() {
+                    enable_browser_input_capture(client_arc.as_ref(), session_id.as_deref()).await;
+                }
+
                 {
                     let mut sc = screencasting.lock().await;
                     *sc = true;
@@ -1035,6 +1040,42 @@ async fn cdp_event_loop(
                                                 *lf = Some(msg_str.clone());
                                             }
                                             let _ = frame_tx.send(msg_str);
+                                        }
+                                    } else if evt.method == "Runtime.bindingCalled" {
+                                        let binding_name = evt.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        if binding_name == CAPTURE_BINDING_NAME {
+                                            if let Some(payload_str) = evt.params.get("payload").and_then(|v| v.as_str()) {
+                                                if let Ok(payload) = serde_json::from_str::<Value>(payload_str) {
+                                                    if let Some(recorder) = &capture.recorder {
+                                                        recorder.write_event(&json!({
+                                                            "kind": "browser_input_raw",
+                                                            "ts": timestamp_ms(),
+                                                            "event": payload.clone(),
+                                                            "frameMeta": capture.last_frame_meta.read().await.clone()
+                                                        }));
+                                                    }
+                                                    if capture.aggressive_checkpoints {
+                                                        let event_kind = payload
+                                                            .get("kind")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("");
+                                                        if matches!(event_kind, "mousedown" | "keydown") {
+                                                            let _ = create_capture_checkpoint(
+                                                                client_arc.as_ref(),
+                                                                evt.session_id.as_deref().or(session_id.as_deref()),
+                                                                &capture,
+                                                            )
+                                                            .await;
+                                                        }
+                                                    }
+                                                    if let Some(capture_id) = payload.get("captureId").and_then(|v| v.as_str()) {
+                                                        let checkpoint_id = capture_id.split(':').next().unwrap_or("").to_string();
+                                                        if !checkpoint_id.is_empty() {
+                                                            *capture.last_checkpoint_id.write().await = Some(checkpoint_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     } else if evt.method == "Runtime.consoleAPICalled" {
                                         let level = evt.params.get("type")
@@ -1174,6 +1215,105 @@ async fn eval_json(
         .await
         .ok()?;
     result.result.value
+}
+
+async fn enable_browser_input_capture(client: &CdpClient, session_id: Option<&str>) {
+    let _ = client
+        .send_command(
+            "Runtime.addBinding",
+            Some(json!({ "name": CAPTURE_BINDING_NAME })),
+            session_id,
+        )
+        .await;
+
+    let source = format!(
+        r#"(function() {{
+  const bindingName = {binding:?};
+  const markerAttr = {marker:?};
+  if ((window).__agentBrowserCaptureInstalled) return;
+  const send = (payload) => {{
+    try {{
+      const fn = window[bindingName];
+      if (typeof fn === 'function') fn(JSON.stringify(payload));
+    }} catch (_err) {{}}
+  }};
+  const markerFor = (node) => {{
+    let el = node instanceof Element ? node : null;
+    while (el) {{
+      const marker = el.getAttribute(markerAttr);
+      if (marker) return marker;
+      el = el.parentElement;
+    }}
+    return null;
+  }};
+  const base = (kind, target) => {{
+    const marker = markerFor(target);
+    return {{
+      kind,
+      ts: Date.now(),
+      captureId: marker,
+      checkpointId: marker ? marker.split(':')[0] : null,
+      targetRef: marker ? marker.split(':')[1] : null,
+      url: location.href
+    }};
+  }};
+  document.addEventListener('mousedown', (event) => {{
+    send({{ ...base('mousedown', event.target), x: event.clientX, y: event.clientY, button: event.button }});
+  }}, true);
+  document.addEventListener('mouseup', (event) => {{
+    send({{ ...base('mouseup', event.target), x: event.clientX, y: event.clientY, button: event.button }});
+  }}, true);
+  document.addEventListener('mousemove', (event) => {{
+    send({{ ...base('mousemove', event.target), x: event.clientX, y: event.clientY }});
+  }}, true);
+  document.addEventListener('wheel', (event) => {{
+    send({{ ...base('wheel', event.target), x: event.clientX, y: event.clientY, deltaX: event.deltaX, deltaY: event.deltaY }});
+  }}, true);
+  document.addEventListener('keydown', (event) => {{
+    send({{ ...base('keydown', event.target), key: event.key, code: event.code, repeat: event.repeat }});
+  }}, true);
+  document.addEventListener('keyup', (event) => {{
+    send({{ ...base('keyup', event.target), key: event.key, code: event.code, repeat: event.repeat }});
+  }}, true);
+  document.addEventListener('input', (event) => {{
+    const t = event.target;
+    const value = (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) ? t.value : null;
+    send({{ ...base('input', t), value }});
+  }}, true);
+  document.addEventListener('touchstart', (event) => {{
+    const t = event.touches[0];
+    send({{ ...base('touchstart', event.target), x: t ? t.clientX : null, y: t ? t.clientY : null }});
+  }}, true);
+  document.addEventListener('touchmove', (event) => {{
+    const t = event.touches[0];
+    send({{ ...base('touchmove', event.target), x: t ? t.clientX : null, y: t ? t.clientY : null }});
+  }}, true);
+  document.addEventListener('touchend', (event) => {{
+    send({{ ...base('touchend', event.target) }});
+  }}, true);
+  document.addEventListener('focusin', (event) => {{
+    send({{ ...base('focusin', event.target) }});
+  }}, true);
+  (window).__agentBrowserCaptureInstalled = true;
+}})();"#,
+        binding = CAPTURE_BINDING_NAME,
+        marker = CAPTURE_MARKER_ATTR
+    );
+
+    let _ = client
+        .send_command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            Some(json!({ "source": source })),
+            session_id,
+        )
+        .await;
+    let _ = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({ "expression": source, "awaitPromise": false })),
+            session_id,
+        )
+        .await;
 }
 
 async fn create_capture_checkpoint(

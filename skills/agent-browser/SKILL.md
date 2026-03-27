@@ -203,7 +203,7 @@ agent-browser diff url <url1> <url2> --selector "#main"  # Scope to element
 
 Every session automatically starts a WebSocket stream server on an OS-assigned port. Use `agent-browser stream status` to see the bound port and connection state. Use `stream disable` to tear it down, and `stream enable --port <port>` to re-enable on a specific port.
 
-For stream-input capture recording (JSONL), enable recorder mode with environment variables:
+For capture recording (JSONL) of stream input and direct in-browser user actions, enable recorder mode with environment variables:
 
 ```bash
 AGENT_BROWSER_CAPTURE_MODE=on \

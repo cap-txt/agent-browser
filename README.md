@@ -978,7 +978,7 @@ The WebSocket server streams the browser viewport and accepts input events.
 
 ### Capture recorder (JSONL)
 
-You can enable an env-driven capture recorder for streamed human input. This mode records raw input, checkpoints, enriched targets, typing bursts, navigation events, and session lifecycle entries as JSONL.
+You can enable an env-driven capture recorder for streamed human input and direct in-browser user interactions. This mode records raw input, checkpoints, enriched targets, typing bursts, navigation events, and session lifecycle entries as JSONL.
 
 ```bash
 AGENT_BROWSER_STREAM_PORT=9223 \
