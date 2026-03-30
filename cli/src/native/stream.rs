@@ -1,7 +1,10 @@
 use serde_json::{json, Value};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -10,10 +13,15 @@ use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::cdp::client::CdpClient;
+use super::cdp::types::{EvaluateParams, EvaluateResult};
 use crate::connection::get_socket_dir;
 #[cfg(windows)]
 use crate::connection::resolve_port;
 use crate::install::get_dashboard_dir;
+
+const CAPTURE_MARKER_ATTR: &str = "data-agent-browser-capture";
+const TYPING_BURST_IDLE_MS: u64 = 400;
+const CAPTURE_BINDING_NAME: &str = "agentBrowserCapture";
 
 /// Frame metadata from CDP Page.screencastFrame events.
 #[derive(Debug, Clone)]
@@ -39,6 +47,64 @@ impl Default for FrameMetadata {
             timestamp: 0,
         }
     }
+}
+
+#[derive(Clone)]
+struct CaptureRecorder {
+    file_path: Option<PathBuf>,
+    stdout: bool,
+}
+
+impl CaptureRecorder {
+    fn from_env() -> Option<Self> {
+        let mode = std::env::var("AGENT_BROWSER_CAPTURE_MODE").unwrap_or_default();
+        let enabled = matches!(mode.as_str(), "1" | "true" | "on" | "ON" | "TRUE");
+        if !enabled {
+            return None;
+        }
+        let file_path = std::env::var("AGENT_BROWSER_CAPTURE_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from);
+        let stdout = std::env::var("AGENT_BROWSER_CAPTURE_STDOUT")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "ON" | "TRUE"))
+            .unwrap_or(false);
+        Some(Self { file_path, stdout })
+    }
+
+    fn write_event(&self, value: &Value) {
+        let line = match serde_json::to_string(value) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if self.stdout {
+            let _ = writeln!(std::io::stdout(), "{}", line);
+        }
+        if let Some(path) = &self.file_path {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{}", line);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CaptureContext {
+    /// Optional JSONL recorder enabled via AGENT_BROWSER_CAPTURE_* env vars.
+    recorder: Option<CaptureRecorder>,
+    last_frame_meta: Arc<RwLock<Option<Value>>>,
+    last_checkpoint_id: Arc<RwLock<Option<String>>>,
+    aggressive_checkpoints: bool,
+}
+
+#[derive(Default)]
+struct TextBurstState {
+    last_key_at: u64,
+    marker: String,
+    keys: Vec<String>,
+    value_before: Option<String>,
+    selection_before: Option<Value>,
 }
 
 pub struct StreamServer {
@@ -192,6 +258,15 @@ impl StreamServer {
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let last_frame = Arc::new(RwLock::new(None::<String>));
         let recording = Arc::new(Mutex::new(false));
+        let capture = CaptureContext {
+            recorder: CaptureRecorder::from_env(),
+            last_frame_meta: Arc::new(RwLock::new(None)),
+            last_checkpoint_id: Arc::new(RwLock::new(None)),
+            aggressive_checkpoints: std::env::var("AGENT_BROWSER_CAPTURE_CHECKPOINTS")
+                .ok()
+                .map(|v| v.eq_ignore_ascii_case("aggressive"))
+                .unwrap_or(false),
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let frame_tx_clone = frame_tx.clone();
@@ -208,6 +283,7 @@ impl StreamServer {
         let last_engine_clone = last_engine.clone();
         let last_frame_clone = last_frame.clone();
         let recording_clone = recording.clone();
+        let capture_clone = capture.clone();
         let accept_shutdown_rx = shutdown_rx.clone();
         let session_name_clone = session_id.clone();
         let accept_task = tokio::spawn(async move {
@@ -226,6 +302,7 @@ impl StreamServer {
                 last_engine_clone,
                 last_frame_clone,
                 recording_clone,
+                capture_clone,
                 accept_shutdown_rx,
                 session_name_clone,
             )
@@ -245,6 +322,7 @@ impl StreamServer {
         let last_tabs_bg = last_tabs.clone();
         let last_engine_bg = last_engine.clone();
         let recording_bg = recording.clone();
+        let capture_bg = capture.clone();
         let cdp_task = tokio::spawn(async move {
             cdp_event_loop(
                 frame_tx_bg,
@@ -259,6 +337,7 @@ impl StreamServer {
                 last_tabs_bg,
                 last_engine_bg,
                 recording_bg,
+                capture_bg,
                 shutdown_rx,
             )
             .await;
@@ -452,6 +531,7 @@ async fn accept_loop(
     last_engine: Arc<RwLock<String>>,
     last_frame: Arc<RwLock<Option<String>>>,
     recording: Arc<Mutex<bool>>,
+    capture: CaptureContext,
     mut shutdown_rx: watch::Receiver<bool>,
     session_name: String,
 ) {
@@ -481,6 +561,7 @@ async fn accept_loop(
                 let le = last_engine.clone();
                 let lf = last_frame.clone();
                 let rec = recording.clone();
+                let cap = capture.clone();
                 let shutdown_rx = shutdown_rx.clone();
                 let sn = session_name.clone();
 
@@ -501,6 +582,7 @@ async fn accept_loop(
                         le,
                         lf,
                         rec,
+                        cap,
                         shutdown_rx,
                         sn,
                     )
@@ -540,6 +622,7 @@ async fn handle_connection(
     last_engine: Arc<RwLock<String>>,
     last_frame: Arc<RwLock<Option<String>>>,
     recording: Arc<Mutex<bool>>,
+    capture: CaptureContext,
     shutdown_rx: watch::Receiver<bool>,
     session_name: Arc<str>,
 ) {
@@ -567,6 +650,7 @@ async fn handle_connection(
             last_engine,
             last_frame,
             recording,
+            capture,
             shutdown_rx,
         )
         .await;
@@ -600,6 +684,7 @@ async fn handle_ws_client(
     last_engine: Arc<RwLock<String>>,
     last_frame: Arc<RwLock<Option<String>>>,
     recording: Arc<Mutex<bool>>,
+    capture: CaptureContext,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let callback =
@@ -671,6 +756,21 @@ async fn handle_ws_client(
 
     // Notify the CDP event loop that a client connected (may trigger auto-start screencast)
     client_notify.notify_one();
+    if let Some(recorder) = &capture.recorder {
+        recorder.write_event(&json!({
+            "kind": "session_start",
+            "ts": timestamp_ms(),
+            "session": "default",
+        }));
+    }
+    {
+        let guard = client_slot.read().await;
+        if let Some(ref client) = *guard {
+            let sid = cdp_session_id.read().await;
+            let _ = create_capture_checkpoint(client.as_ref(), sid.as_deref(), &capture).await;
+        }
+    }
+    let mut text_burst: Option<TextBurstState> = None;
 
     loop {
         tokio::select! {
@@ -700,7 +800,14 @@ async fn handle_ws_client(
                         let guard = client_slot.read().await;
                         if let Some(ref client) = *guard {
                             let sid = cdp_session_id.read().await;
-                            handle_client_message(&text, client.as_ref(), sid.as_deref()).await;
+                            handle_client_message(
+                                &text,
+                                client.as_ref(),
+                                sid.as_deref(),
+                                &capture,
+                                &mut text_burst,
+                            )
+                            .await;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -713,6 +820,27 @@ async fn handle_ws_client(
     {
         let mut count = client_count.lock().await;
         *count = count.saturating_sub(1);
+    }
+    if let Some(tb) = text_burst.take() {
+        if let Some(recorder) = &capture.recorder {
+            recorder.write_event(&json!({
+                "kind": "text_burst",
+                "ts": timestamp_ms(),
+                "checkpointId": tb.marker.split(':').next().unwrap_or(""),
+                "targetRef": tb.marker.split(':').nth(1).unwrap_or(""),
+                "captureId": tb.marker,
+                "keys": tb.keys,
+                "valueBefore": tb.value_before,
+                "selectionBefore": tb.selection_before.unwrap_or(Value::Null)
+            }));
+        }
+    }
+    if let Some(recorder) = &capture.recorder {
+        recorder.write_event(&json!({
+            "kind": "session_end",
+            "ts": timestamp_ms(),
+            "session": "default",
+        }));
     }
 
     // Notify the CDP event loop that a client disconnected (may trigger auto-stop screencast)
@@ -735,6 +863,7 @@ async fn cdp_event_loop(
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
+    capture: CaptureContext,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -758,13 +887,18 @@ async fn cdp_event_loop(
             _ = client_notify.notified() => {}
         }
 
-        // Check if we have WS clients and a CDP client
+        // Capture recording must keep listening to CDP events even when there
+        // are no attached WS clients. Plain CLI commands like `open` should
+        // still emit JSONL/stdout capture output.
         let count = *client_count.lock().await;
+        let capture_enabled = capture.recorder.is_some();
         let guard = client_slot.read().await;
 
-        if count > 0 {
+        if count > 0 || capture_enabled {
             if let Some(ref client) = *guard {
-                // We have WS clients and a CDP client — start screencast and listen for frames
+                // Start listening for CDP events whenever either a WS client is
+                // attached or capture recording is enabled. Screencasting is
+                // still only needed for live viewers.
                 let mut event_rx = client.subscribe();
                 let client_arc = Arc::clone(client);
                 drop(guard);
@@ -776,50 +910,60 @@ async fn cdp_event_loop(
                 let vw = *viewport_width.lock().await;
                 let vh = *viewport_height.lock().await;
 
-                let _ = client_arc
-                    .send_command(
-                        "Page.startScreencast",
-                        Some(json!({
-                            "format": "jpeg",
-                            "quality": 80,
-                            "maxWidth": vw,
-                            "maxHeight": vh,
-                            "everyNthFrame": 1,
-                        })),
-                        session_id.as_deref(),
-                    )
-                    .await;
+                if count > 0 {
+                    let _ = client_arc
+                        .send_command(
+                            "Page.startScreencast",
+                            Some(json!({
+                                "format": "jpeg",
+                                "quality": 80,
+                                "maxWidth": vw,
+                                "maxHeight": vh,
+                                "everyNthFrame": 1,
+                            })),
+                            session_id.as_deref(),
+                        )
+                        .await;
+                }
 
-                {
+                if capture_enabled {
+                    enable_browser_input_capture(client_arc.as_ref(), session_id.as_deref()).await;
+                }
+
+                if count > 0 {
                     let mut sc = screencasting.lock().await;
                     *sc = true;
                 }
 
-                // Broadcast screencasting:true status with current viewport
-                let eng = last_engine.read().await.clone();
-                let rec = *recording.lock().await;
-                let status = json!({
-                    "type": "status",
-                    "connected": true,
-                    "screencasting": true,
-                    "viewportWidth": vw,
-                    "viewportHeight": vh,
-                    "engine": eng,
-                    "recording": rec,
-                });
-                let _ = frame_tx.send(status.to_string());
+                if count > 0 {
+                    // Broadcast screencasting:true status with current viewport
+                    let eng = last_engine.read().await.clone();
+                    let rec = *recording.lock().await;
+                    let status = json!({
+                        "type": "status",
+                        "connected": true,
+                        "screencasting": true,
+                        "viewportWidth": vw,
+                        "viewportHeight": vh,
+                        "engine": eng,
+                        "recording": rec,
+                    });
+                    let _ = frame_tx.send(status.to_string());
+                }
 
                 // Process CDP events in real-time until client disconnects or CDP closes
                 loop {
                     tokio::select! {
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
-                                let session_id = cdp_session_id.read().await.clone();
-                                let _ = client_arc
-                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                    .await;
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                if count > 0 {
+                                    let session_id = cdp_session_id.read().await.clone();
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                    let mut sc = screencasting.lock().await;
+                                    *sc = false;
+                                }
                                 return;
                             }
                         }
@@ -849,8 +993,32 @@ async fn cdp_event_loop(
                                                         "timestamp": timestamp_ms(),
                                                     });
                                                     let _ = frame_tx.send(msg.to_string());
+                                                    if let Some(recorder) = &capture.recorder {
+                                                        recorder.write_event(&json!({
+                                                            "kind": "navigation",
+                                                            "ts": timestamp_ms(),
+                                                            "url": url
+                                                        }));
+                                                    }
+                                                    if capture.aggressive_checkpoints {
+                                                        let _ = create_capture_checkpoint(
+                                                            client_arc.as_ref(),
+                                                            evt.session_id.as_deref().or(session_id.as_deref()),
+                                                            &capture,
+                                                        )
+                                                        .await;
+                                                    }
                                                 }
                                             }
+                                        }
+                                    } else if evt.method == "Page.loadEventFired" {
+                                        if capture.recorder.is_some() {
+                                            let _ = create_capture_checkpoint(
+                                                client_arc.as_ref(),
+                                                evt.session_id.as_deref().or(session_id.as_deref()),
+                                                &capture,
+                                            )
+                                            .await;
                                         }
                                     } else if evt.method == "Page.screencastFrame" {
                                         if let Some(sid) = evt.params.get("sessionId").and_then(|v| v.as_i64()) {
@@ -877,11 +1045,57 @@ async fn cdp_event_loop(
                                                 }
                                             });
                                             let msg_str = msg.to_string();
+                                            if let Some(metadata) = msg.get("metadata").cloned() {
+                                                *capture.last_frame_meta.write().await = Some(metadata.clone());
+                                                if let Some(recorder) = &capture.recorder {
+                                                    recorder.write_event(&json!({
+                                                        "kind": "frame_meta",
+                                                        "ts": timestamp_ms(),
+                                                        "metadata": metadata
+                                                    }));
+                                                }
+                                            }
                                             {
                                                 let mut lf = last_frame.write().await;
                                                 *lf = Some(msg_str.clone());
                                             }
                                             let _ = frame_tx.send(msg_str);
+                                        }
+                                    } else if evt.method == "Runtime.bindingCalled" {
+                                        let binding_name = evt.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        if binding_name == CAPTURE_BINDING_NAME {
+                                            if let Some(payload_str) = evt.params.get("payload").and_then(|v| v.as_str()) {
+                                                if let Ok(payload) = serde_json::from_str::<Value>(payload_str) {
+                                                    if let Some(recorder) = &capture.recorder {
+                                                        recorder.write_event(&json!({
+                                                            "kind": "browser_input_raw",
+                                                            "ts": timestamp_ms(),
+                                                            "event": payload.clone(),
+                                                            "frameMeta": capture.last_frame_meta.read().await.clone()
+                                                        }));
+                                                    }
+                                                    if capture.aggressive_checkpoints {
+                                                        let event_kind = payload
+                                                            .get("kind")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("");
+                                                        if matches!(event_kind, "mousedown" | "keydown") {
+                                                            let _ = create_capture_checkpoint(
+                                                                client_arc.as_ref(),
+                                                                evt.session_id.as_deref().or(session_id.as_deref()),
+                                                                &capture,
+                                                            )
+                                                            .await;
+                                                        }
+                                                    }
+                                                    if let Some(capture_id) = payload.get("captureId").and_then(|v| v.as_str()) {
+                                                        let checkpoint_id = capture_id.split(':').next().unwrap_or("").to_string();
+                                                        if !checkpoint_id.is_empty() {
+                                                            *capture.last_checkpoint_id.write().await = Some(checkpoint_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     } else if evt.method == "Runtime.consoleAPICalled" {
                                         let level = evt.params.get("type")
@@ -941,13 +1155,16 @@ async fn cdp_event_loop(
                         // Also check for notify (client count change, CDP client change, session switch, or viewport change)
                         _ = client_notify.notified() => {
                             let count = *client_count.lock().await;
+                            let capture_enabled = capture.recorder.is_some();
                             let new_session_id = cdp_session_id.read().await.clone();
-                            if count == 0 {
-                                let _ = client_arc
-                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                    .await;
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                            if count == 0 && !capture_enabled {
+                                if *screencasting.lock().await {
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                    let mut sc = screencasting.lock().await;
+                                    *sc = false;
+                                }
                                 break;
                             }
                             let client_changed = {
@@ -963,11 +1180,13 @@ async fn cdp_event_loop(
                             let viewport_changed = new_vw != vw || new_vh != vh;
                             if client_changed || session_changed || viewport_changed {
                                 // Stop screencast, restart loop to pick up new settings
-                                let _ = client_arc
-                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                    .await;
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                if count > 0 && *screencasting.lock().await {
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                    let mut sc = screencasting.lock().await;
+                                    *sc = false;
+                                }
                                 client_notify.notify_one();
                                 break;
                             }
@@ -996,16 +1215,341 @@ async fn cdp_event_loop(
     }
 }
 
-async fn handle_client_message(msg: &str, client: &CdpClient, session_id: Option<&str>) {
+fn timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+async fn eval_json(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    expression: &str,
+) -> Option<Value> {
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: expression.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            session_id,
+        )
+        .await
+        .ok()?;
+    result.result.value
+}
+
+async fn enable_browser_input_capture(client: &CdpClient, session_id: Option<&str>) {
+    let _ = client
+        .send_command(
+            "Runtime.addBinding",
+            Some(json!({ "name": CAPTURE_BINDING_NAME })),
+            session_id,
+        )
+        .await;
+
+    let source = format!(
+        r#"(function() {{
+  const bindingName = {binding:?};
+  const markerAttr = {marker:?};
+  if ((window).__agentBrowserCaptureInstalled) return;
+  const send = (payload) => {{
+    try {{
+      const fn = window[bindingName];
+      if (typeof fn === 'function') fn(JSON.stringify(payload));
+    }} catch (_err) {{}}
+  }};
+  const markerFor = (node) => {{
+    let el = node instanceof Element ? node : null;
+    while (el) {{
+      const marker = el.getAttribute(markerAttr);
+      if (marker) return marker;
+      el = el.parentElement;
+    }}
+    return null;
+  }};
+  const base = (kind, target) => {{
+    const marker = markerFor(target);
+    return {{
+      kind,
+      ts: Date.now(),
+      captureId: marker,
+      checkpointId: marker ? marker.split(':')[0] : null,
+      targetRef: marker ? marker.split(':')[1] : null,
+      url: location.href
+    }};
+  }};
+  document.addEventListener('mousedown', (event) => {{
+    send({{ ...base('mousedown', event.target), x: event.clientX, y: event.clientY, button: event.button }});
+  }}, true);
+  document.addEventListener('mouseup', (event) => {{
+    send({{ ...base('mouseup', event.target), x: event.clientX, y: event.clientY, button: event.button }});
+  }}, true);
+  document.addEventListener('mousemove', (event) => {{
+    send({{ ...base('mousemove', event.target), x: event.clientX, y: event.clientY }});
+  }}, true);
+  document.addEventListener('wheel', (event) => {{
+    send({{ ...base('wheel', event.target), x: event.clientX, y: event.clientY, deltaX: event.deltaX, deltaY: event.deltaY }});
+  }}, true);
+  document.addEventListener('keydown', (event) => {{
+    send({{ ...base('keydown', event.target), key: event.key, code: event.code, repeat: event.repeat }});
+  }}, true);
+  document.addEventListener('keyup', (event) => {{
+    send({{ ...base('keyup', event.target), key: event.key, code: event.code, repeat: event.repeat }});
+  }}, true);
+  document.addEventListener('beforeinput', (event) => {{
+    const t = event.target;
+    send({{
+      ...base('beforeinput', t),
+      inputType: event.inputType || null,
+      data: event.data ?? null
+    }});
+  }}, true);
+  document.addEventListener('input', (event) => {{
+    const t = event.target;
+    const value = (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) ? t.value : null;
+    send({{
+      ...base('input', t),
+      inputType: event.inputType || null,
+      data: event.data ?? null,
+      value
+    }});
+  }}, true);
+  document.addEventListener('change', (event) => {{
+    const t = event.target;
+    const value = (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement) ? t.value : null;
+    send({{ ...base('change', t), value }});
+  }}, true);
+  document.addEventListener('click', (event) => {{
+    send({{ ...base('click', event.target), x: event.clientX, y: event.clientY, button: event.button }});
+  }}, true);
+  document.addEventListener('touchstart', (event) => {{
+    const t = event.touches[0];
+    send({{ ...base('touchstart', event.target), x: t ? t.clientX : null, y: t ? t.clientY : null }});
+  }}, true);
+  document.addEventListener('touchmove', (event) => {{
+    const t = event.touches[0];
+    send({{ ...base('touchmove', event.target), x: t ? t.clientX : null, y: t ? t.clientY : null }});
+  }}, true);
+  document.addEventListener('touchend', (event) => {{
+    send({{ ...base('touchend', event.target) }});
+  }}, true);
+  document.addEventListener('focusin', (event) => {{
+    send({{ ...base('focusin', event.target) }});
+  }}, true);
+  (window).__agentBrowserCaptureInstalled = true;
+}})();"#,
+        binding = CAPTURE_BINDING_NAME,
+        marker = CAPTURE_MARKER_ATTR
+    );
+
+    let _ = client
+        .send_command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            Some(json!({ "source": source })),
+            session_id,
+        )
+        .await;
+    let _ = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({ "expression": source, "awaitPromise": false })),
+            session_id,
+        )
+        .await;
+}
+
+async fn create_capture_checkpoint(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    capture: &CaptureContext,
+) -> Option<String> {
+    let checkpoint_id = format!("cp{}", timestamp_ms());
+    let js = format!(
+        r#"(() => {{
+            const checkpointId = {checkpoint:?};
+            const markerAttr = {marker:?};
+            document.querySelectorAll(`[${{markerAttr}}]`).forEach((el) => el.removeAttribute(markerAttr));
+            const sel = [
+              'a','button','input','select','textarea','summary',
+              '[role]','[tabindex]','[onclick]','[contenteditable=""]','[contenteditable="true"]'
+            ].join(',');
+            const elements = Array.from(document.querySelectorAll(sel));
+            const refs = {{}};
+            let i = 1;
+            for (const el of elements) {{
+              if (!(el instanceof HTMLElement)) continue;
+              const ref = `e${{i++}}`;
+              const captureId = `${{checkpointId}}:${{ref}}`;
+              el.setAttribute(markerAttr, captureId);
+              const rect = el.getBoundingClientRect();
+              refs[ref] = {{
+                ref,
+                role: el.getAttribute('role') || null,
+                name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 160),
+                captureId,
+                box: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }},
+                tagName: el.tagName.toLowerCase(),
+                inputType: el instanceof HTMLInputElement ? el.type : null,
+                editable: el.isContentEditable || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
+              }};
+            }}
+            return {{
+              id: checkpointId,
+              ts: Date.now(),
+              url: location.href,
+              title: document.title || '',
+              refs
+            }};
+        }})()"#,
+        checkpoint = checkpoint_id,
+        marker = CAPTURE_MARKER_ATTR
+    );
+    let checkpoint = eval_json(client, session_id, &js).await?;
+    if let Some(recorder) = &capture.recorder {
+        recorder.write_event(
+            &json!({ "kind": "checkpoint", "ts": timestamp_ms(), "checkpoint": checkpoint }),
+        );
+    }
+    *capture.last_checkpoint_id.write().await = Some(checkpoint_id.clone());
+    Some(checkpoint_id)
+}
+
+async fn resolve_capture_target_at_point(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    x: f64,
+    y: f64,
+) -> Option<Value> {
+    let js = format!(
+        r#"(() => {{
+            let el = document.elementFromPoint({x}, {y});
+            while (el) {{
+              if (el instanceof HTMLElement) {{
+                const marker = el.getAttribute({marker:?});
+                if (marker) {{
+                  const rect = el.getBoundingClientRect();
+                  const [checkpointId, targetRef] = marker.split(':');
+                  return {{
+                    captureId: marker,
+                    checkpointId,
+                    targetRef,
+                    tagName: el.tagName.toLowerCase(),
+                    rect: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }}
+                  }};
+                }}
+              }}
+              el = el.parentElement;
+            }}
+            return null;
+        }})()"#,
+        x = x,
+        y = y,
+        marker = CAPTURE_MARKER_ATTR
+    );
+    eval_json(client, session_id, &js).await
+}
+
+async fn get_active_capture_target(client: &CdpClient, session_id: Option<&str>) -> Option<Value> {
+    let js = format!(
+        r#"(() => {{
+            let el = document.activeElement;
+            while (el) {{
+              if (el instanceof HTMLElement) {{
+                const marker = el.getAttribute({marker:?});
+                if (marker) {{
+                  const value = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.value : null;
+                  const selectionStart = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionStart : null;
+                  const selectionEnd = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionEnd : null;
+                  const [checkpointId, targetRef] = marker.split(':');
+                  return {{
+                    captureId: marker,
+                    checkpointId,
+                    targetRef,
+                    tagName: el.tagName.toLowerCase(),
+                    value,
+                    selection: {{ start: selectionStart, end: selectionEnd }}
+                  }};
+                }}
+              }}
+              el = el.parentElement;
+            }}
+            return null;
+        }})()"#,
+        marker = CAPTURE_MARKER_ATTR
+    );
+    eval_json(client, session_id, &js).await
+}
+
+async fn handle_client_message(
+    msg: &str,
+    client: &CdpClient,
+    session_id: Option<&str>,
+    capture: &CaptureContext,
+    text_burst: &mut Option<TextBurstState>,
+) {
     let parsed: Value = match serde_json::from_str(msg) {
         Ok(v) => v,
         Err(_) => return,
     };
 
     let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let now = timestamp_ms();
+    let frame_meta = capture.last_frame_meta.read().await.clone();
+
+    if let Some(recorder) = &capture.recorder {
+        recorder.write_event(&json!({
+            "kind": "stream_input_raw",
+            "ts": now,
+            "message": parsed.clone(),
+            "frameMeta": frame_meta
+        }));
+    }
 
     match msg_type {
         "input_mouse" => {
+            if capture.aggressive_checkpoints
+                && parsed.get("eventType").and_then(|v| v.as_str()) == Some("mousePressed")
+            {
+                let _ = create_capture_checkpoint(client, session_id, capture).await;
+            }
+            if let Some(tb) = text_burst.take() {
+                if let Some(recorder) = &capture.recorder {
+                    let after = get_active_capture_target(client, session_id).await;
+                    recorder.write_event(&json!({
+                        "kind": "text_burst",
+                        "ts": now,
+                        "checkpointId": tb.marker.split(':').next().unwrap_or(""),
+                        "targetRef": tb.marker.split(':').nth(1).unwrap_or(""),
+                        "captureId": tb.marker,
+                        "keys": tb.keys,
+                        "valueBefore": tb.value_before,
+                        "valueAfter": after.as_ref().and_then(|a| a.get("value")).cloned().unwrap_or(Value::Null),
+                        "selectionBefore": tb.selection_before.unwrap_or(Value::Null),
+                        "selectionAfter": after.as_ref().and_then(|a| a.get("selection")).cloned().unwrap_or(Value::Null)
+                    }));
+                }
+            }
+            let target = resolve_capture_target_at_point(
+                client,
+                session_id,
+                parsed.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                parsed.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            )
+            .await;
+            if let Some(recorder) = &capture.recorder {
+                recorder.write_event(&json!({
+                    "kind": "stream_input_enriched",
+                    "ts": now,
+                    "checkpointId": capture.last_checkpoint_id.read().await.clone(),
+                    "message": parsed.clone(),
+                    "target": target,
+                    "frameMeta": frame_meta
+                }));
+            }
             let _ = client
                 .send_command(
                     "Input.dispatchMouseEvent",
@@ -1024,6 +1568,93 @@ async fn handle_client_message(msg: &str, client: &CdpClient, session_id: Option
                 .await;
         }
         "input_keyboard" => {
+            let event_type = parsed
+                .get("eventType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if capture.aggressive_checkpoints
+                && text_burst.is_none()
+                && (event_type == "char" || event_type == "keyDown")
+            {
+                let _ = create_capture_checkpoint(client, session_id, capture).await;
+            }
+            let target = get_active_capture_target(client, session_id).await;
+            if let Some(recorder) = &capture.recorder {
+                recorder.write_event(&json!({
+                    "kind": "stream_input_enriched",
+                    "ts": now,
+                    "checkpointId": capture.last_checkpoint_id.read().await.clone(),
+                    "message": parsed.clone(),
+                    "target": target,
+                    "frameMeta": frame_meta
+                }));
+            }
+            if event_type == "char" || event_type == "keyDown" {
+                let key = parsed
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| parsed.get("key").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                if !key.is_empty() {
+                    let marker = target
+                        .as_ref()
+                        .and_then(|v| v.get("captureId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !marker.is_empty() {
+                        let renew = text_burst
+                            .as_ref()
+                            .map(|t| {
+                                t.marker != marker
+                                    || now.saturating_sub(t.last_key_at) > TYPING_BURST_IDLE_MS
+                            })
+                            .unwrap_or(true);
+                        if renew {
+                            *text_burst = Some(TextBurstState {
+                                last_key_at: now,
+                                marker: marker.clone(),
+                                keys: vec![key],
+                                value_before: target
+                                    .as_ref()
+                                    .and_then(|v| v.get("value"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
+                                selection_before: target
+                                    .as_ref()
+                                    .and_then(|v| v.get("selection"))
+                                    .cloned(),
+                            });
+                        } else if let Some(tb) = text_burst.as_mut() {
+                            tb.last_key_at = now;
+                            tb.keys.push(key);
+                        }
+                    }
+                }
+            }
+            if matches!(
+                parsed.get("key").and_then(|v| v.as_str()),
+                Some("Enter" | "Tab")
+            ) {
+                if let Some(tb) = text_burst.take() {
+                    if let Some(recorder) = &capture.recorder {
+                        let after = get_active_capture_target(client, session_id).await;
+                        recorder.write_event(&json!({
+                            "kind": "text_burst",
+                            "ts": now,
+                            "checkpointId": tb.marker.split(':').next().unwrap_or(""),
+                            "targetRef": tb.marker.split(':').nth(1).unwrap_or(""),
+                            "captureId": tb.marker,
+                            "keys": tb.keys,
+                            "valueBefore": tb.value_before,
+                            "valueAfter": after.as_ref().and_then(|a| a.get("value")).cloned().unwrap_or(Value::Null),
+                            "selectionBefore": tb.selection_before.unwrap_or(Value::Null),
+                            "selectionAfter": after.as_ref().and_then(|a| a.get("selection")).cloned().unwrap_or(Value::Null)
+                        }));
+                    }
+                }
+            }
             let _ = client
                 .send_command(
                     "Input.dispatchKeyEvent",
@@ -1040,6 +1671,16 @@ async fn handle_client_message(msg: &str, client: &CdpClient, session_id: Option
                 .await;
         }
         "input_touch" => {
+            if let Some(recorder) = &capture.recorder {
+                recorder.write_event(&json!({
+                    "kind": "stream_input_enriched",
+                    "ts": now,
+                    "checkpointId": capture.last_checkpoint_id.read().await.clone(),
+                    "message": parsed.clone(),
+                    "target": Value::Null,
+                    "frameMeta": frame_meta
+                }));
+            }
             let _ = client
                 .send_command(
                     "Input.dispatchTouchEvent",
@@ -1058,7 +1699,6 @@ async fn handle_client_message(msg: &str, client: &CdpClient, session_id: Option
         _ => {}
     }
 }
-
 const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
 
 /// Serve an HTTP request for dashboard static files or the fallback page.
@@ -1396,13 +2036,6 @@ fn is_process_alive(pid_path: &Path) -> bool {
         // On non-Unix, just check if the pid file exists
         true
     }
-}
-
-fn timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 pub fn is_allowed_origin(origin: Option<&str>) -> bool {

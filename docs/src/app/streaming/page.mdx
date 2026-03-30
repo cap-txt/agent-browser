@@ -67,6 +67,28 @@ The server sends frame messages with base64-encoded images:
 }
 ```
 
+## Capture recorder (JSONL)
+
+Streaming can also record human demonstration data as JSONL, including direct in-browser user actions and stream-injected input. Enable capture mode via environment variables:
+
+```bash
+AGENT_BROWSER_CAPTURE_MODE=on \
+AGENT_BROWSER_CAPTURE_FILE=./capture.jsonl \
+AGENT_BROWSER_CAPTURE_STDOUT=1 \
+AGENT_BROWSER_CAPTURE_CHECKPOINTS=aggressive \
+agent-browser open https://example.com
+```
+
+Capture mode records:
+
+- `session_start` / `session_end`
+- `frame_meta`
+- `checkpoint`
+- `stream_input_raw`
+- `stream_input_enriched`
+- `text_burst`
+- `navigation`
+
 ### Status messages
 
 Connection and screencast status:
