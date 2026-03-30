@@ -17,6 +17,7 @@ cli/*.o
 # Logs
 *.log
 npm-debug.log*
+capture.jsonl
 
 # IDE
 .idea/

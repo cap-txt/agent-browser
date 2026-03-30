@@ -887,13 +887,18 @@ async fn cdp_event_loop(
             _ = client_notify.notified() => {}
         }
 
-        // Check if we have WS clients and a CDP client
+        // Capture recording must keep listening to CDP events even when there
+        // are no attached WS clients. Plain CLI commands like `open` should
+        // still emit JSONL/stdout capture output.
         let count = *client_count.lock().await;
+        let capture_enabled = capture.recorder.is_some();
         let guard = client_slot.read().await;
 
-        if count > 0 {
+        if count > 0 || capture_enabled {
             if let Some(ref client) = *guard {
-                // We have WS clients and a CDP client — start screencast and listen for frames
+                // Start listening for CDP events whenever either a WS client is
+                // attached or capture recording is enabled. Screencasting is
+                // still only needed for live viewers.
                 let mut event_rx = client.subscribe();
                 let client_arc = Arc::clone(client);
                 drop(guard);
@@ -905,54 +910,60 @@ async fn cdp_event_loop(
                 let vw = *viewport_width.lock().await;
                 let vh = *viewport_height.lock().await;
 
-                let _ = client_arc
-                    .send_command(
-                        "Page.startScreencast",
-                        Some(json!({
-                            "format": "jpeg",
-                            "quality": 80,
-                            "maxWidth": vw,
-                            "maxHeight": vh,
-                            "everyNthFrame": 1,
-                        })),
-                        session_id.as_deref(),
-                    )
-                    .await;
+                if count > 0 {
+                    let _ = client_arc
+                        .send_command(
+                            "Page.startScreencast",
+                            Some(json!({
+                                "format": "jpeg",
+                                "quality": 80,
+                                "maxWidth": vw,
+                                "maxHeight": vh,
+                                "everyNthFrame": 1,
+                            })),
+                            session_id.as_deref(),
+                        )
+                        .await;
+                }
 
-                if capture.recorder.is_some() {
+                if capture_enabled {
                     enable_browser_input_capture(client_arc.as_ref(), session_id.as_deref()).await;
                 }
 
-                {
+                if count > 0 {
                     let mut sc = screencasting.lock().await;
                     *sc = true;
                 }
 
-                // Broadcast screencasting:true status with current viewport
-                let eng = last_engine.read().await.clone();
-                let rec = *recording.lock().await;
-                let status = json!({
-                    "type": "status",
-                    "connected": true,
-                    "screencasting": true,
-                    "viewportWidth": vw,
-                    "viewportHeight": vh,
-                    "engine": eng,
-                    "recording": rec,
-                });
-                let _ = frame_tx.send(status.to_string());
+                if count > 0 {
+                    // Broadcast screencasting:true status with current viewport
+                    let eng = last_engine.read().await.clone();
+                    let rec = *recording.lock().await;
+                    let status = json!({
+                        "type": "status",
+                        "connected": true,
+                        "screencasting": true,
+                        "viewportWidth": vw,
+                        "viewportHeight": vh,
+                        "engine": eng,
+                        "recording": rec,
+                    });
+                    let _ = frame_tx.send(status.to_string());
+                }
 
                 // Process CDP events in real-time until client disconnects or CDP closes
                 loop {
                     tokio::select! {
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
-                                let session_id = cdp_session_id.read().await.clone();
-                                let _ = client_arc
-                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                    .await;
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                if count > 0 {
+                                    let session_id = cdp_session_id.read().await.clone();
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                    let mut sc = screencasting.lock().await;
+                                    *sc = false;
+                                }
                                 return;
                             }
                         }
@@ -999,6 +1010,15 @@ async fn cdp_event_loop(
                                                     }
                                                 }
                                             }
+                                        }
+                                    } else if evt.method == "Page.loadEventFired" {
+                                        if capture.recorder.is_some() {
+                                            let _ = create_capture_checkpoint(
+                                                client_arc.as_ref(),
+                                                evt.session_id.as_deref().or(session_id.as_deref()),
+                                                &capture,
+                                            )
+                                            .await;
                                         }
                                     } else if evt.method == "Page.screencastFrame" {
                                         if let Some(sid) = evt.params.get("sessionId").and_then(|v| v.as_i64()) {
@@ -1135,13 +1155,16 @@ async fn cdp_event_loop(
                         // Also check for notify (client count change, CDP client change, session switch, or viewport change)
                         _ = client_notify.notified() => {
                             let count = *client_count.lock().await;
+                            let capture_enabled = capture.recorder.is_some();
                             let new_session_id = cdp_session_id.read().await.clone();
-                            if count == 0 {
-                                let _ = client_arc
-                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                    .await;
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                            if count == 0 && !capture_enabled {
+                                if *screencasting.lock().await {
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                    let mut sc = screencasting.lock().await;
+                                    *sc = false;
+                                }
                                 break;
                             }
                             let client_changed = {
@@ -1157,11 +1180,13 @@ async fn cdp_event_loop(
                             let viewport_changed = new_vw != vw || new_vh != vh;
                             if client_changed || session_changed || viewport_changed {
                                 // Stop screencast, restart loop to pick up new settings
-                                let _ = client_arc
-                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                    .await;
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
+                                if count > 0 && *screencasting.lock().await {
+                                    let _ = client_arc
+                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                        .await;
+                                    let mut sc = screencasting.lock().await;
+                                    *sc = false;
+                                }
                                 client_notify.notify_one();
                                 break;
                             }
@@ -1275,10 +1300,31 @@ async fn enable_browser_input_capture(client: &CdpClient, session_id: Option<&st
   document.addEventListener('keyup', (event) => {{
     send({{ ...base('keyup', event.target), key: event.key, code: event.code, repeat: event.repeat }});
   }}, true);
+  document.addEventListener('beforeinput', (event) => {{
+    const t = event.target;
+    send({{
+      ...base('beforeinput', t),
+      inputType: event.inputType || null,
+      data: event.data ?? null
+    }});
+  }}, true);
   document.addEventListener('input', (event) => {{
     const t = event.target;
     const value = (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) ? t.value : null;
-    send({{ ...base('input', t), value }});
+    send({{
+      ...base('input', t),
+      inputType: event.inputType || null,
+      data: event.data ?? null,
+      value
+    }});
+  }}, true);
+  document.addEventListener('change', (event) => {{
+    const t = event.target;
+    const value = (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement) ? t.value : null;
+    send({{ ...base('change', t), value }});
+  }}, true);
+  document.addEventListener('click', (event) => {{
+    send({{ ...base('click', event.target), x: event.clientX, y: event.clientY, button: event.button }});
   }}, true);
   document.addEventListener('touchstart', (event) => {{
     const t = event.touches[0];

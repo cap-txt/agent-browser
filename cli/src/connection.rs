@@ -221,6 +221,12 @@ pub struct DaemonOptions<'a> {
     pub cdp: Option<&'a str>,
 }
 
+fn capture_stdout_enabled() -> bool {
+    env::var("AGENT_BROWSER_CAPTURE_STDOUT")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on" | "ON" | "TRUE"))
+}
+
 fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
     cmd.env("AGENT_BROWSER_DAEMON", "1")
         .env("AGENT_BROWSER_SESSION", session);
@@ -368,6 +374,11 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        let daemon_stdout = if capture_stdout_enabled() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
 
         let mut cmd = Command::new(&exe_path);
         cmd.env("AGENT_BROWSER_DAEMON", "1");
@@ -382,7 +393,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
         daemon_child = Some(
             cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(daemon_stdout)
                 .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("Failed to start daemon: {}", e))?,
@@ -392,6 +403,11 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let daemon_stdout = if capture_stdout_enabled() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
 
         let mut cmd = Command::new(&exe_path);
         cmd.env("AGENT_BROWSER_DAEMON", "1");
@@ -403,7 +419,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         daemon_child = Some(
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(daemon_stdout)
                 .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("Failed to start daemon: {}", e))?,
